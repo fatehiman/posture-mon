@@ -1,0 +1,7 @@
+opencv-python>=4.8
+mediapipe==0.10.14
+
+pillow>=10.0
+numpy>=1.24
+pygrabber>=0.2; platform_system == "Windows"
+pystray>=0.19

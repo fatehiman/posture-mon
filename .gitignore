@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Runtime / personal data (the app writes its real config to %APPDATA%)
+config.json
+
+# Logs
+*.log
+err.txt
