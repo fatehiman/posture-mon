@@ -127,6 +127,7 @@ GROUP_OF = {
 VISIBILITY_THRESHOLD = 0.6      # landmark confidence to count as "detected"
 STABLE_FRAMES_NEEDED = 8        # consecutive good frames before we let you SAVE
 MONITOR_INTERVAL_S = 10.0       # how often we check + beep
+AUTO_PAUSE_TIMEOUT_S = 10.0     # no body for this long -> auto-pause (user away)
 DEFAULT_TOLERANCES = {"eyes": 1.0, "head": 2.0, "shoulders": 5.0}
 DEFAULT_SHOULDER_CM = 40.0
 
@@ -276,13 +277,22 @@ def save_config(cfg):
         json.dump(cfg, fh, indent=2)
 
 
-def make_icon_image(size=64):
-    """Five connected dots (eyes / nose / shoulders) on a rectangular background."""
+def make_icon_image(size=64, paused=False, grayed=False):
+    """Five connected dots (eyes / nose / shoulders) on a rectangular background.
+
+    - ``paused``: draw a red diagonal line across the icon (manually paused).
+    - ``grayed``: use a muted gray palette (auto-paused — body not detected).
+    """
     from PIL import ImageDraw
+    # Gray palette signals "not detected"; blue is the normal active state.
+    if grayed:
+        bg, fg = (120, 120, 120, 255), (205, 205, 205, 255)
+    else:
+        bg, fg = (41, 98, 165, 255), (255, 255, 255, 255)
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle([1, 1, size - 2, size - 2], radius=max(6, size // 7),
-                        fill=(41, 98, 165, 255))
+                        fill=bg)
     s = size / 64.0
 
     def P(x, y):
@@ -293,16 +303,22 @@ def make_icon_image(size=64):
     sh_l, sh_r = P(15, 50), P(49, 50)
     eyes_mid = P(32, 18)
 
-    white = (255, 255, 255, 255)
     lw = max(2, int(3 * s))
-    d.line([eye_l, eye_r], fill=white, width=lw)     # eyes ----
-    d.line([eyes_mid, nose], fill=white, width=lw)   # | down to nose
-    d.line([nose, sh_l], fill=white, width=lw)       # / to left shoulder
-    d.line([nose, sh_r], fill=white, width=lw)       # \ to right shoulder
+    d.line([eye_l, eye_r], fill=fg, width=lw)     # eyes ----
+    d.line([eyes_mid, nose], fill=fg, width=lw)   # | down to nose
+    d.line([nose, sh_l], fill=fg, width=lw)       # / to left shoulder
+    d.line([nose, sh_r], fill=fg, width=lw)       # \ to right shoulder
 
     r = max(3, int(5 * s))
     for (x, y) in (eye_l, eye_r, nose, sh_l, sh_r):
-        d.ellipse([x - r, y - r, x + r, y + r], fill=white)
+        d.ellipse([x - r, y - r, x + r, y + r], fill=fg)
+
+    if paused:
+        # Diagonal "disabled" slash: a white halo underneath for contrast,
+        # then a bold red line corner-to-corner.
+        a, b = P(8, 8), P(56, 56)
+        d.line([a, b], fill=(255, 255, 255, 255), width=max(5, int(10 * s)))
+        d.line([a, b], fill=(220, 30, 30, 255), width=max(3, int(6 * s)))
     return img
 
 
@@ -384,6 +400,13 @@ class PostureMonitor:
         self.last_posture_good = True
         self.alive = True
         self.tray = None
+        self.paused = False  # when True, suppress all beeps (toggled from tray)
+        # Auto-pause: go silent + gray the icon when no body is seen for a
+        # while (user away). On by default; reverts the moment a body returns.
+        self.auto_pause_enabled = True
+        self.auto_paused = False
+        self.last_seen_t = None     # last time a body was detected
+        self._body_present = False  # set each frame from the pose result
 
         # Blink tracking. Face Mesh is created lazily, only when the reminder
         # is enabled, so disabling it costs nothing.
@@ -557,12 +580,56 @@ class PostureMonitor:
         self.saved_shoulder_px = None
         self.stable_count = 0
         self._reset_blink_timer()
+        self._reset_auto_pause()
         self.state = "DETECTING"
         self._show_controls_for_state()
+
+    # --------------------------------------------------------------- alerts
+    def _beep(self, freq=200, duration_ms=500):
+        """Play an alert tone, unless paused (manually or auto)."""
+        if self.paused or self.auto_paused:
+            return
+        play_beep(freq, duration_ms)
+
+    def _refresh_tray_icon(self):
+        """Set the tray icon to match the current pause state."""
+        if self.tray is None:
+            return
+        grayed = self.auto_paused and not self.paused
+        self.tray.icon = make_icon_image(64, paused=self.paused, grayed=grayed)
+
+    def _update_auto_pause(self, now, body_present):
+        """Auto-pause when no body is seen for AUTO_PAUSE_TIMEOUT_S; revert as
+        soon as a body reappears. Only active while the toggle is enabled."""
+        if not self.auto_pause_enabled:
+            if self.auto_paused:                 # toggle was turned off
+                self.auto_paused = False
+                self._refresh_tray_icon()
+            self.last_seen_t = now
+            return
+
+        if body_present:
+            self.last_seen_t = now
+            if self.auto_paused:                 # user came back -> resume
+                self.auto_paused = False
+                self._refresh_tray_icon()
+            return
+
+        if self.last_seen_t is None:
+            self.last_seen_t = now
+        if not self.auto_paused and now - self.last_seen_t >= AUTO_PAUSE_TIMEOUT_S:
+            self.auto_paused = True               # user away -> go silent + gray
+            self._refresh_tray_icon()
 
     # --------------------------------------------------------------- blink
     def _blink_enabled(self):
         return self.blink_reminder_sec > 0
+
+    def _reset_auto_pause(self):
+        """Clear any active auto-pause and restore the icon."""
+        self.auto_paused = False
+        self.last_seen_t = None
+        self._refresh_tray_icon()
 
     def _reset_blink_timer(self):
         """Restart the no-blink countdown from now and silence any beeping."""
@@ -606,7 +673,7 @@ class PostureMonitor:
         overdue = elapsed >= self.blink_reminder_sec
         if overdue and now - self.last_blink_beep_t >= BLINK_BEEP_INTERVAL_S:
             self.last_blink_beep_t = now
-            play_beep(BLINK_BEEP_FREQ, BLINK_BEEP_DURATION_MS)
+            self._beep(BLINK_BEEP_FREQ, BLINK_BEEP_DURATION_MS)
 
         # Overlay a small blink status on the video.
         if ear is None:
@@ -653,6 +720,9 @@ class PostureMonitor:
         if result.pose_landmarks:
             pts = self._extract_points(result.pose_landmarks.landmark, w, h)
         self._last_points = pts
+        # A body is "present" if MediaPipe found any pose at all (used by
+        # auto-pause to decide whether the user is at the computer).
+        self._body_present = result.pose_landmarks is not None
 
         # Blink detection only runs while monitoring and only if enabled.
         if self.state == "MONITOR" and self._blink_enabled():
@@ -737,6 +807,9 @@ class PostureMonitor:
 
         now = time.time()
 
+        # Auto-pause check: silence + gray the icon when the user is away.
+        self._update_auto_pause(now, self._body_present)
+
         # Blink reminder runs independently of posture — it works off the face,
         # so keep it going even when the shoulders drop out of frame.
         if self._blink_enabled():
@@ -753,7 +826,7 @@ class PostureMonitor:
         if now - self.last_check_t >= MONITOR_INTERVAL_S:
             self.last_check_t = now
             if not all_inside:
-                play_beep()
+                self._beep()
 
         if all_inside:
             self.status.config(text="✓ Good posture", fg="#1a7f1a")
@@ -778,6 +851,10 @@ class PostureMonitor:
     def start_tray(self, notify=None):
         menu = pystray.Menu(
             pystray.MenuItem("Show/Hide", self._tray_toggle, default=True),
+            pystray.MenuItem("Paused", self._tray_toggle_pause,
+                             checked=lambda item: self.paused),
+            pystray.MenuItem("Auto pause", self._tray_toggle_auto_pause,
+                             checked=lambda item: self.auto_pause_enabled),
             pystray.MenuItem("Reset", self._tray_reset),
             pystray.MenuItem("Exit", self._tray_exit),
         )
@@ -799,6 +876,21 @@ class PostureMonitor:
     # Tray callbacks run on pystray's thread -> marshal onto the Tk main loop.
     def _tray_toggle(self, *_):
         self.root.after(0, self.toggle_window)
+
+    def _tray_toggle_pause(self, icon, item):
+        # Pausing only flips a flag + swaps the tray icon — no Tk involved, so
+        # it's safe to run on pystray's own thread.
+        self.paused = not self.paused
+        self._refresh_tray_icon()
+        icon.update_menu()  # refresh the check mark
+
+    def _tray_toggle_auto_pause(self, icon, item):
+        self.auto_pause_enabled = not self.auto_pause_enabled
+        if not self.auto_pause_enabled:   # disabling clears any active auto-pause
+            self.auto_paused = False
+            self.last_seen_t = None
+        self._refresh_tray_icon()
+        icon.update_menu()
 
     def _tray_reset(self, *_):
         self.root.after(0, self.do_reset)
@@ -843,6 +935,7 @@ class PostureMonitor:
         self.saved_shoulder_px = None
         self.stable_count = 0
         self._reset_blink_timer()
+        self._reset_auto_pause()
         self.state = "DETECTING"
         self._show_controls_for_state()
         self.show_window()

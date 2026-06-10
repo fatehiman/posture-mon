@@ -5,12 +5,28 @@ and beeps at you when you slouch. It can also remind you to **blink** — useful
 for preventing dry eyes during long screen sessions. Runs as a **system-tray
 app**.
 
+## Download
+
+Grab the latest standalone Windows executable (no Python needed) from the
+[**Releases** page](https://github.com/fatehiman/posture-mon/releases/latest) —
+download `PostureMonitor.exe` and run it. (First launch is a little slow as the
+one-file bundle unpacks.) Prefer to run from source or build it yourself? See
+[Setup](#setup) and [Building the .exe](#building-the-exe) below.
+
 ## System tray
 
 The app lives in the system tray (its icon is five connected dots — eyes, nose
 and shoulders — on a blue rectangle). **Right-click** the icon for:
 
 - **Show** — bring the window back (also the default double-click action).
+- **Paused** — a toggle (shows a check mark when on). While paused, **no beeps
+  play** (posture *or* blink), and the tray icon shows a **red diagonal slash**
+  over the five-dot mark to signal it's suspended. Toggle it off to resume.
+- **Auto pause** — a toggle, **on by default** (check mark). When on, if **no
+  body is detected for 10 seconds** the app assumes you've stepped away: it goes
+  **silent** (like a manual pause) and the tray icon turns **gray**. The moment
+  your body is detected again it **resumes automatically** and the icon returns
+  to normal. Turn it off if you don't want away-detection.
 - **Reset** — start over: re-ask which webcam to use and re-calibrate your good
   posture. Your remembered values (tolerances, shoulder width, last camera) are
   **kept**, not cleared.
