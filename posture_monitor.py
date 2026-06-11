@@ -37,7 +37,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 import cv2
 import numpy as np
@@ -108,6 +108,19 @@ BLINK_BEEP_INTERVAL_S = 3.0
 # two are easy to tell apart.
 BLINK_BEEP_FREQ = 300
 BLINK_BEEP_DURATION_MS = 250
+# How the blink reminder alerts you. "beep only" plays the tone above; the
+# "popup:<corner>" modes instead fade in a borderless eye reminder in that
+# screen corner (no beep) until you blink or move the mouse over it.
+BLINK_NOTIFY_BEEP = "beep only"
+BLINK_NOTIFY_MODES = [
+    BLINK_NOTIFY_BEEP,
+    "popup:top-right",
+    "popup:top-left",
+    "popup:bottom-right",
+    "popup:bottom-left",
+]
+# Eye-reminder popup size.
+BLINK_POPUP_W, BLINK_POPUP_H = 200, 80
 POINTS = {
     "nose": LM.NOSE.value,
     "left_eye": LM.LEFT_EYE.value,
@@ -173,6 +186,18 @@ def list_cameras(max_probe=6):
 
 
 PREVIEW_W, PREVIEW_H = 360, 270
+
+
+def center_window(win):
+    """Center a window horizontally; place its top at 10% of the screen height
+    (the same fixed Y for every window). Its size is unchanged."""
+    win.update_idletasks()
+    w = win.winfo_reqwidth()
+    sw = win.winfo_screenwidth()
+    sh = win.winfo_screenheight()
+    x = max(0, (sw - w) // 2)
+    y = int(sh * 0.10)
+    win.geometry("+%d+%d" % (x, y))
 
 
 def choose_camera(parent, cams, preselect_index):
@@ -258,6 +283,7 @@ def choose_camera(parent, cams, preselect_index):
 
     open_cam(state["index"])
     update_preview()
+    center_window(top)
     parent.wait_window(top)
     return state["index"]
 
@@ -319,6 +345,62 @@ def make_icon_image(size=64, paused=False, grayed=False):
         a, b = P(8, 8), P(56, 56)
         d.line([a, b], fill=(255, 255, 255, 255), width=max(5, int(10 * s)))
         d.line([a, b], fill=(220, 30, 30, 255), width=max(3, int(6 * s)))
+    return img
+
+
+def _load_font(size):
+    """Best-effort TrueType font; falls back to PIL's bitmap default."""
+    from PIL import ImageFont
+    for name in ("segoeui.ttf", "arialbd.ttf", "arial.ttf", "DejaVuSans.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+# Card color for the blink popup; the Toplevel background is set to match so
+# the rounded corners blend seamlessly (no gray gaps).
+BLINK_POPUP_BG = (20, 40, 70)
+BLINK_POPUP_BG_HEX = "#%02x%02x%02x" % BLINK_POPUP_BG
+
+
+def make_eye_image(w=BLINK_POPUP_W, h=BLINK_POPUP_H):
+    """A 'Blink!' reminder card: a drawn eye on the left, text on the right."""
+    from PIL import ImageDraw
+    img = Image.new("RGBA", (w, h), BLINK_POPUP_BG + (255,))
+    d = ImageDraw.Draw(img)
+    # Rounded white border just inside the edge.
+    d.rounded_rectangle([3, 3, w - 4, h - 4], radius=14,
+                        outline=(255, 255, 255, 255), width=2)
+
+    # Eye, centered in the left portion.
+    cx, cy = h * 0.62, h * 0.5
+    ew, eh = h * 0.38, h * 0.22          # sclera half-width / half-height
+    d.ellipse([cx - ew, cy - eh, cx + ew, cy + eh],
+              fill=(245, 245, 245, 255), outline=(30, 30, 30, 255), width=1)
+    ir = eh * 0.95                        # iris
+    d.ellipse([cx - ir, cy - ir, cx + ir, cy + ir], fill=(70, 140, 210, 255))
+    pr = ir * 0.5                         # pupil
+    d.ellipse([cx - pr, cy - pr, cx + pr, cy + pr], fill=(12, 12, 12, 255))
+    hr = pr * 0.4                         # catch-light highlight
+    hx, hy = cx - pr * 0.35, cy - pr * 0.35
+    d.ellipse([hx - hr, hy - hr, hx + hr, hy + hr], fill=(255, 255, 255, 255))
+    # Upper-lid lash curve over the sclera.
+    d.arc([cx - ew, cy - eh, cx + ew, cy + eh], start=200, end=340,
+          fill=(30, 30, 30, 255), width=2)
+
+    # "Blink!" text to the right of the eye, vertically centered.
+    font = _load_font(int(h * 0.42))
+    text = "Blink!"
+    try:
+        bbox = d.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        ty = (h - th) / 2 - bbox[1]
+    except Exception:                     # very old Pillow without textbbox
+        ty = h * 0.3
+    tx = cx + ew + 14
+    d.text((tx, ty), text, font=font, fill=(255, 255, 255, 255))
     return img
 
 
@@ -387,6 +469,10 @@ class PostureMonitor:
         )
         # Blink reminder: seconds allowed without a blink (0 = feature off).
         self.blink_reminder_sec = float(self.cfg.get("blink_reminder_sec", 0))
+        # How the reminder alerts: "beep only" or "popup:<corner>".
+        self.blink_notify_mode = self.cfg.get("blink_notify_mode", BLINK_NOTIFY_BEEP)
+        if self.blink_notify_mode not in BLINK_NOTIFY_MODES:
+            self.blink_notify_mode = BLINK_NOTIFY_BEEP
 
         # Saved template: absolute pixel position of each point at SAVE time.
         # These stay FIXED on screen; you move your body back into them.
@@ -415,6 +501,12 @@ class PostureMonitor:
         self.last_blink_t = None         # when the last blink was seen
         self.last_blink_beep_t = 0.0
         self._last_ear = None
+        # Eye-reminder popup (popup:* modes): the live Toplevel + its fade state.
+        self.blink_popup = None
+        self.blink_popup_alpha = 0.0
+        self._eye_photo = None           # cached PhotoImage for the popup
+        # One-time flag: center + size the window after the first real frame.
+        self._geom_ready = False
 
         # --- camera ---
         self.cap = cv2.VideoCapture(camera_index, BACKEND)
@@ -496,6 +588,15 @@ class PostureMonitor:
         self.blink_entry.insert(0, str(self.blink_reminder_sec))
         self.blink_entry.grid(row=2, column=3, pady=(6, 0), sticky="w")
 
+        tk.Label(self.tol_frame, text="blink alert:",
+                 font=("Segoe UI", 11)).grid(row=3, column=0, columnspan=3,
+                                             pady=(6, 0), sticky="e")
+        self.blink_mode_combo = ttk.Combobox(
+            self.tol_frame, width=18, state="readonly", values=BLINK_NOTIFY_MODES)
+        self.blink_mode_combo.set(self.blink_notify_mode)
+        self.blink_mode_combo.grid(row=3, column=3, columnspan=3,
+                                   pady=(6, 0), sticky="w")
+
         self.btn_save_tol = tk.Button(
             self.controls, text="SAVE tolerances & start",
             font=("Segoe UI", 12, "bold"), width=22, command=self.save_tolerances
@@ -524,10 +625,14 @@ class PostureMonitor:
         elif self.state == "TOLERANCE":
             self.status.config(
                 text="Set how far each part may move before alerting (cm).")
-            self.tol_frame.pack()
-            self.btn_save_tol.pack(pady=(8, 0))
+            # Button first so it lines up with CALIBRATE / MONITOR; fields below.
+            self.btn_save_tol.pack()
+            self.tol_frame.pack(pady=(8, 0))
         elif self.state == "MONITOR":
             self.btn_recal.pack()
+
+        # Re-fit the minimum size to this state's controls and re-center.
+        self.root.after_idle(self._refresh_geometry)
 
     # -------------------------------------------------------------- actions
     def save_posture(self):
@@ -561,9 +666,11 @@ class PostureMonitor:
         self.tolerances = tol
         self.real_shoulder_cm = shoulder_cm
         self.blink_reminder_sec = blink_sec
+        self.blink_notify_mode = self.blink_mode_combo.get() or BLINK_NOTIFY_BEEP
         self.cfg["tolerances"] = tol
         self.cfg["real_shoulder_cm"] = shoulder_cm
         self.cfg["blink_reminder_sec"] = blink_sec
+        self.cfg["blink_notify_mode"] = self.blink_notify_mode
         self._reset_blink_timer()
         # Persist the template so /silent can resume monitoring next time.
         self.cfg["template"] = {
@@ -632,10 +739,14 @@ class PostureMonitor:
         self._refresh_tray_icon()
 
     def _reset_blink_timer(self):
-        """Restart the no-blink countdown from now and silence any beeping."""
+        """Restart the no-blink countdown from now and silence any reminder."""
         self.eye_closed = False
         self.last_blink_t = None
         self.last_blink_beep_t = 0.0
+        self._hide_blink_popup()
+
+    def _blink_mode_is_popup(self):
+        return self.blink_notify_mode.startswith("popup:")
 
     def _ensure_face_mesh(self):
         if self.face_mesh is None:
@@ -671,7 +782,12 @@ class PostureMonitor:
 
         elapsed = now - self.last_blink_t
         overdue = elapsed >= self.blink_reminder_sec
-        if overdue and now - self.last_blink_beep_t >= BLINK_BEEP_INTERVAL_S:
+        if not overdue or self.paused or self.auto_paused:
+            # Caught up, or alerts suppressed -> nothing should be on screen.
+            self._hide_blink_popup()
+        elif self._blink_mode_is_popup():
+            self._show_blink_popup()      # idempotent; fades in once
+        elif now - self.last_blink_beep_t >= BLINK_BEEP_INTERVAL_S:
             self.last_blink_beep_t = now
             self._beep(BLINK_BEEP_FREQ, BLINK_BEEP_DURATION_MS)
 
@@ -684,6 +800,71 @@ class PostureMonitor:
             text, color = f"blink in {self.blink_reminder_sec - elapsed:.0f}s", C_GREEN
         cv2.putText(frame, text, (8, frame.shape[0] - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+
+    # --------------------------------------------------------- blink popup
+    def _blink_popup_xy(self, corner):
+        """Top-left screen position for the popup in the requested corner."""
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        m = 28                                  # edge margin
+        taskbar = 48                            # keep clear of a bottom taskbar
+        x = sw - BLINK_POPUP_W - m if "right" in corner else m
+        y = m if "top" in corner else sh - BLINK_POPUP_H - m - taskbar
+        return x, y
+
+    def _show_blink_popup(self):
+        """Fade in the borderless eye reminder (no-op if one is already up)."""
+        if self.blink_popup is not None:
+            return
+        corner = self.blink_notify_mode.split(":", 1)[1]
+        if self._eye_photo is None:
+            self._eye_photo = ImageTk.PhotoImage(make_eye_image())
+
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)              # borderless
+        win.configure(bg=BLINK_POPUP_BG_HEX)    # seamless rounded corners
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.0)       # start invisible for the fade
+        except tk.TclError:
+            pass
+        x, y = self._blink_popup_xy(corner)
+        win.geometry(f"{BLINK_POPUP_W}x{BLINK_POPUP_H}+{x}+{y}")
+
+        lbl = tk.Label(win, image=self._eye_photo, bg=BLINK_POPUP_BG_HEX,
+                       borderwidth=0, highlightthickness=0)
+        lbl.pack()
+        # Mouse moving onto the reminder dismisses it and snoozes the countdown.
+        win.bind("<Enter>", lambda _e: self._snooze_blink_popup())
+        lbl.bind("<Enter>", lambda _e: self._snooze_blink_popup())
+
+        self.blink_popup = win
+        self.blink_popup_alpha = 0.0
+        self._fade_in_blink_popup()
+
+    def _fade_in_blink_popup(self):
+        if self.blink_popup is None:
+            return
+        self.blink_popup_alpha = min(1.0, self.blink_popup_alpha + 0.1)
+        try:
+            self.blink_popup.attributes("-alpha", self.blink_popup_alpha)
+        except tk.TclError:
+            return
+        if self.blink_popup_alpha < 1.0:
+            self.root.after(25, self._fade_in_blink_popup)
+
+    def _hide_blink_popup(self):
+        if self.blink_popup is not None:
+            try:
+                self.blink_popup.destroy()
+            except tk.TclError:
+                pass
+            self.blink_popup = None
+
+    def _snooze_blink_popup(self):
+        """Mouse touched the popup: dismiss it and restart the no-blink clock."""
+        self._hide_blink_popup()
+        self.last_blink_t = time.time()
 
     # ------------------------------------------------------------- geometry
     @staticmethod
@@ -746,6 +927,10 @@ class PostureMonitor:
             self._run_monitor(frame, pts)
 
         self._render(frame)
+        if not self._geom_ready:
+            # First frame gives the video its true size -> now we can size+center.
+            self._geom_ready = True
+            self.root.after_idle(self._refresh_geometry)
         self.root.after(15, self.update_frame)
 
     def _run_detecting(self, frame, pts):
@@ -909,6 +1094,32 @@ class PostureMonitor:
         else:
             self.show_window()
 
+    def _refresh_geometry(self):
+        """Set the window's minimum size to fit the current controls (so the
+        tolerance fields can never be clipped) and re-position it: centered
+        horizontally with its top fixed at 10% of the screen height, so the
+        button stays put across all three states."""
+        if not self.alive:
+            return
+        try:
+            self.root.update_idletasks()
+            w = self.root.winfo_reqwidth()
+            h = self.root.winfo_reqheight()
+        except tk.TclError:
+            return
+        if w <= 1 or h <= 1:
+            return
+        # Minimum = required size for this state: shrinking can't hide fields.
+        self.root.minsize(w, h)
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = int(sh * 0.10)
+        try:
+            self.root.geometry("+%d+%d" % (x, y))
+        except tk.TclError:
+            pass
+
     def show_window(self):
         self.root.deiconify()
         self.root.lift()
@@ -942,6 +1153,7 @@ class PostureMonitor:
 
     def do_exit(self):
         self.alive = False
+        self._hide_blink_popup()
         if self.tray is not None:
             try:
                 self.tray.stop()
