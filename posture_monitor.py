@@ -291,7 +291,9 @@ def choose_camera(parent, cams, preselect_index):
 def load_config():
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as fh:
+            # utf-8-sig: tolerate a BOM (e.g. if the file was hand-edited on
+            # Windows), which plain utf-8 would reject and silently reset.
+            with open(CONFIG_PATH, "r", encoding="utf-8-sig") as fh:
                 return json.load(fh)
         except (json.JSONDecodeError, OSError):
             pass
@@ -308,6 +310,9 @@ def make_icon_image(size=64, paused=False, grayed=False):
 
     - ``paused``: draw a red diagonal line across the icon (manually paused).
     - ``grayed``: use a muted gray palette (auto-paused — body not detected).
+
+    Both together = the app is Disabled (gray *and* slashed), which is how the
+    fully-off state is told apart from a transient auto-pause.
     """
     from PIL import ImageDraw
     # Gray palette signals "not detected"; blue is the normal active state.
@@ -455,10 +460,13 @@ def pick_camera(parent):
 
 
 class PostureMonitor:
-    def __init__(self, root, camera_index=0, silent=False):
+    def __init__(self, root, camera_index=0, silent=False, disabled=False):
         self.root = root
         self.camera_index = camera_index
         self.silent = silent
+        # Disabled = the app is entirely off: no camera is opened, nothing is
+        # processed and no alert can fire. Persisted in config.json.
+        self.disabled = disabled
         self.root.title("Posture Monitor")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -509,32 +517,27 @@ class PostureMonitor:
         self._geom_ready = False
 
         # --- camera ---
-        self.cap = cv2.VideoCapture(camera_index, BACKEND)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        if not self.cap.isOpened():
-            if not silent:
-                messagebox.showerror(
-                    "Posture Monitor", "Could not open the webcam.")
-            self.alive = False
-            return
-
-        # Silent start: skip calibration UI and monitor with the saved template.
-        # If there is no usable saved template, there is nothing to do silently.
-        if silent:
-            if self.template and self.saved_shoulder_px:
-                self.state = "MONITOR"
-            else:
-                self.cap.release()
+        # While disabled we never touch a video device at all, so a missing or
+        # busy webcam can't produce any error popup.
+        self.cap = None
+        self.pose = None
+        if not disabled:
+            if not self._open_capture():
+                if not silent:
+                    messagebox.showerror(
+                        "Posture Monitor", "Could not open the webcam.")
                 self.alive = False
                 return
 
-        self.pose = mp_pose.Pose(
-            model_complexity=1,
-            smooth_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
+            # Silent start: skip calibration UI and monitor with the saved
+            # template. With no usable template there is nothing to do silently.
+            if silent:
+                if self.template and self.saved_shoulder_px:
+                    self.state = "MONITOR"
+                else:
+                    self._stop_capture()
+                    self.alive = False
+                    return
 
         # --- UI ---
         self.status = tk.Label(root, text="", font=("Segoe UI", 13), pady=6)
@@ -553,7 +556,38 @@ class PostureMonitor:
         self._icon_photo = ImageTk.PhotoImage(make_icon_image(64))
         self.root.iconphoto(True, self._icon_photo)
 
-        self.update_frame()
+        if not self.disabled:
+            self.update_frame()
+
+    # -------------------------------------------------------------- capture
+    def _open_capture(self):
+        """Open the webcam + create the Pose model. False if the camera failed."""
+        cap = cv2.VideoCapture(self.camera_index, BACKEND)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        self.cap = cap
+        self.pose = mp_pose.Pose(
+            model_complexity=1,
+            smooth_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        return True
+
+    def _stop_capture(self):
+        """Release the video device and every model that reads from it."""
+        for attr, close in (("cap", "release"), ("pose", "close"),
+                            ("face_mesh", "close")):
+            obj = getattr(self, attr, None)
+            if obj is not None:
+                try:
+                    getattr(obj, close)()
+                except Exception:
+                    pass
+                setattr(self, attr, None)
 
     # ------------------------------------------------------------------ UI
     def _build_controls(self):
@@ -693,17 +727,23 @@ class PostureMonitor:
 
     # --------------------------------------------------------------- alerts
     def _beep(self, freq=200, duration_ms=500):
-        """Play an alert tone, unless paused (manually or auto)."""
-        if self.paused or self.auto_paused:
+        """Play an alert tone, unless disabled or paused (manually or auto)."""
+        if self.disabled or self.paused or self.auto_paused:
             return
         play_beep(freq, duration_ms)
 
     def _refresh_tray_icon(self):
-        """Set the tray icon to match the current pause state."""
+        """Set the tray icon + tooltip to match the current pause/disabled state."""
         if self.tray is None:
             return
-        grayed = self.auto_paused and not self.paused
-        self.tray.icon = make_icon_image(64, paused=self.paused, grayed=grayed)
+        if self.disabled:
+            paused, grayed = True, True          # gray *and* slashed = off
+        else:
+            paused = self.paused
+            grayed = self.auto_paused and not self.paused
+        self.tray.icon = make_icon_image(64, paused=paused, grayed=grayed)
+        self.tray.title = ("Posture Monitor — disabled" if self.disabled
+                           else "Posture Monitor")
 
     def _update_auto_pause(self, now, body_present):
         """Auto-pause when no body is seen for AUTO_PAUSE_TIMEOUT_S; revert as
@@ -885,7 +925,9 @@ class PostureMonitor:
 
     # ---------------------------------------------------------- main loop
     def update_frame(self):
-        if not self.alive:
+        # Returning without rescheduling ends the loop — that is how disabling
+        # stops all processing.
+        if not self.alive or self.disabled or self.cap is None:
             return
         ok, frame = self.cap.read()
         if not ok:
@@ -1034,17 +1076,25 @@ class PostureMonitor:
 
     # --------------------------------------------------------- tray / window
     def start_tray(self, notify=None):
+        # Everything except Disabled/Exit is greyed out while disabled — there
+        # is no camera running for those actions to act on.
+        live = lambda item: not self.disabled
         menu = pystray.Menu(
-            pystray.MenuItem("Show/Hide", self._tray_toggle, default=True),
+            pystray.MenuItem("Show/Hide", self._tray_toggle, default=True,
+                             enabled=live),
             pystray.MenuItem("Paused", self._tray_toggle_pause,
-                             checked=lambda item: self.paused),
+                             checked=lambda item: self.paused, enabled=live),
             pystray.MenuItem("Auto pause", self._tray_toggle_auto_pause,
-                             checked=lambda item: self.auto_pause_enabled),
-            pystray.MenuItem("Reset", self._tray_reset),
+                             checked=lambda item: self.auto_pause_enabled,
+                             enabled=live),
+            pystray.MenuItem("Disabled", self._tray_toggle_disabled,
+                             checked=lambda item: self.disabled),
+            pystray.MenuItem("Reset", self._tray_reset, enabled=live),
             pystray.MenuItem("Exit", self._tray_exit),
         )
-        self.tray = pystray.Icon(
-            "PostureMonitor", make_icon_image(64), "Posture Monitor", menu)
+        icon_img = make_icon_image(64, paused=self.disabled, grayed=self.disabled)
+        title = "Posture Monitor — disabled" if self.disabled else "Posture Monitor"
+        self.tray = pystray.Icon("PostureMonitor", icon_img, title, menu)
 
         def runner():
             def setup(icon):
@@ -1076,6 +1126,70 @@ class PostureMonitor:
             self.last_seen_t = None
         self._refresh_tray_icon()
         icon.update_menu()
+
+    def _tray_toggle_disabled(self, icon, item):
+        self.disabled = not self.disabled
+        self.cfg["disabled"] = self.disabled
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+        self._refresh_tray_icon()
+        icon.update_menu()
+        # Releasing / re-opening the camera touches Tk -> do it on the main loop.
+        self.root.after(0, self.do_disable if self.disabled else self.do_enable)
+
+    def do_disable(self):
+        """Turn everything off: stop the frame loop, free the video device."""
+        self._hide_blink_popup()
+        self.root.withdraw()
+        self._stop_capture()          # update_frame already stopped rescheduling
+        self.auto_paused = False
+        self.last_seen_t = None
+
+    def do_enable(self):
+        """Turn back on: acquire a camera and resume where we can."""
+        if not self.alive or self.disabled:
+            return
+        if self.cfg.get("camera_index") is None:
+            index, name = pick_camera(self.root)
+            if index is None:
+                self._force_disabled()
+                return
+            self.camera_index = index
+            self.cfg["camera_index"], self.cfg["camera_name"] = index, name
+        if not self._open_capture():
+            messagebox.showerror("Posture Monitor", "Could not open the webcam.")
+            self._force_disabled()
+            return
+        self.stable_count = 0
+        self._reset_blink_timer()
+        self._reset_auto_pause()
+        if self.template and self.saved_shoulder_px:
+            self.state = "MONITOR"        # saved profile -> straight back to work
+            self.last_check_t = 0.0
+        else:
+            self.state = "DETECTING"      # nothing calibrated yet -> show the UI
+        self._show_controls_for_state()
+        if self.state != "MONITOR":
+            self.show_window()
+        self.update_frame()
+
+    def _force_disabled(self):
+        """Fall back to the disabled state when enabling could not get a camera."""
+        self.disabled = True
+        self.cfg["disabled"] = True
+        try:
+            save_config(self.cfg)
+        except OSError:
+            pass
+        self._stop_capture()
+        self._refresh_tray_icon()
+        if self.tray is not None:
+            try:
+                self.tray.update_menu()
+            except Exception:
+                pass
 
     def _tray_reset(self, *_):
         self.root.after(0, self.do_reset)
@@ -1131,14 +1245,14 @@ class PostureMonitor:
 
     def do_reset(self):
         """Start from scratch: re-ask the webcam, recalibrate. Keep saved values."""
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
         index, name = pick_camera(self.root)
-        if index is None:                      # no camera -> reopen the old one
-            self.cap = cv2.VideoCapture(self.camera_index, BACKEND)
-        else:
+        if index is not None:                  # no camera -> reopen the old one
             self.camera_index = index
             self.cfg["camera_index"], self.cfg["camera_name"] = index, name
-            self.cap = cv2.VideoCapture(index, BACKEND)
+        self.cap = cv2.VideoCapture(self.camera_index, BACKEND)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         # Recalibrate posture, but keep remembered tolerances / shoulder width.
@@ -1160,10 +1274,7 @@ class PostureMonitor:
             except Exception:
                 pass
         try:
-            self.cap.release()
-            self.pose.close()
-            if self.face_mesh is not None:
-                self.face_mesh.close()
+            self._stop_capture()
         finally:
             self.root.destroy()
 
@@ -1191,9 +1302,19 @@ def main():
     root = tk.Tk()
     root.withdraw()
 
+    cfg = load_config()
+    if cfg.get("disabled"):
+        # Remembered as disabled: sit in the tray only — no video device is
+        # opened, no window, no notification. Re-enable from the tray menu.
+        _dbg("config says disabled -> tray only")
+        app = PostureMonitor(root, camera_index=cfg.get("camera_index") or 0,
+                             silent=silent, disabled=True)
+        app.start_tray()
+        root.mainloop()
+        return
+
     if silent:
         # No popups, no window: resume monitoring with the last saved settings.
-        cfg = load_config()
         has_profile = (cfg.get("camera_index") is not None and cfg.get("template")
                        and cfg.get("saved_shoulder_px") is not None)
         _dbg(f"silent: has_profile={has_profile}")

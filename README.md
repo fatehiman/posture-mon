@@ -27,6 +27,15 @@ and shoulders — on a blue rectangle). **Right-click** the icon for:
   **silent** (like a manual pause) and the tray icon turns **gray**. The moment
   your body is detected again it **resumes automatically** and the icon returns
   to normal. Turn it off if you don't want away-detection.
+- **Disabled** — a toggle that turns the app **entirely off**. While disabled the
+  app **releases the webcam and never opens any video input device**, so it can't
+  produce camera errors or any alert; the tray icon goes **gray with a red
+  slash** and the other menu items are grayed out. This setting is
+  **remembered** — if you quit while disabled, the next launch (including
+  `/silent`) starts straight into the tray with **no camera, no window and no
+  notification**. Un-tick it to acquire the camera again and resume: with a saved
+  profile it goes straight back to monitoring, otherwise the window opens so you
+  can calibrate.
 - **Reset** — start over: re-ask which webcam to use and re-calibrate your good
   posture. Your remembered values (tolerances, shoulder width, last camera) are
   **kept**, not cleared.
@@ -51,7 +60,9 @@ PostureMonitor.exe /silent
 Ideal for auto-start on login. If there is **no saved profile yet**, the
 `/silent` argument is **ignored** and the app opens normally, starting with the
 webcam-selection window so you can calibrate. After you've saved a profile once,
-`/silent` runs straight to the tray. To start with Windows, drop a shortcut to
+`/silent` runs straight to the tray. If the app was left **Disabled**, `/silent`
+(and a normal launch) just parks a gray icon in the tray without touching the
+webcam. To start with Windows, drop a shortcut to
 `PostureMonitor.exe /silent` in your Startup folder (`shell:startup`).
 
 ## How it works
@@ -140,5 +151,5 @@ five-dot icon. (First launch is a little slow as the one-file bundle unpacks.)
 - `requirements.txt` — dependencies.
 - `build_exe.ps1` — PyInstaller build script.
 - `icon.ico` — app icon (generated from the five-dot mark).
-- `config.json` — remembered values (camera, tolerances, shoulder width, calibrated posture, blink-reminder seconds). Stored in **`%APPDATA%\PostureMonitor\config.json`** so it persists for both the script and the one-file exe.
+- `config.json` — remembered values (camera, tolerances, shoulder width, calibrated posture, blink-reminder seconds, disabled flag). Stored in **`%APPDATA%\PostureMonitor\config.json`** so it persists for both the script and the one-file exe.
 - `dist\PostureMonitor.exe` — the built executable.
